@@ -1,9 +1,316 @@
-import { Controller, Get, Header } from '@nestjs/common';
+import { Body, Controller, Get, Header, Logger, Param, Post, Res } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
+import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
+import type { Response } from 'express';
+
+interface AsrTestBody {
+  audio: string; // base64 (no data: prefix)
+  mime: string; // e.g. "audio/webm"
+}
+
+// In-memory temp store for audio. Auto-purges after 5 min.
+const TEMP_AUDIO_STORE = new Map<string, { bytes: Buffer; mime: string; expiresAt: number }>();
+
+function pruneExpiredAudio() {
+  const now = Date.now();
+  for (const [k, v] of TEMP_AUDIO_STORE) if (v.expiresAt < now) TEMP_AUDIO_STORE.delete(k);
+}
 
 @ApiExcludeController()
 @Controller('sim')
 export class SimulatorController {
+  private readonly logger = new Logger(SimulatorController.name);
+
+  constructor(private readonly config: ConfigService) {}
+
+  @Get('asr-temp/:id')
+  async asrTemp(@Param('id') id: string, @Res() res: Response) {
+    pruneExpiredAudio();
+    const item = TEMP_AUDIO_STORE.get(id);
+    if (!item) {
+      res.status(404).send('not found');
+      return;
+    }
+    res.setHeader('Content-Type', item.mime);
+    res.setHeader('Content-Length', item.bytes.length);
+    res.send(item.bytes);
+  }
+
+  @Post('asr-test')
+  async asrTest(@Body() body: AsrTestBody) {
+    const apiKey = this.config.get<string>('ALIBABA_API_KEY');
+    if (!apiKey) return { error: 'ALIBABA_API_KEY not set' };
+
+    this.logger.log(`ASR test: ${body.mime}, ${body.audio.length} base64 chars`);
+    const audioBytes = Buffer.from(body.audio, 'base64');
+    pruneExpiredAudio();
+    const id = randomUUID();
+    TEMP_AUDIO_STORE.set(id, { bytes: audioBytes, mime: body.mime, expiresAt: Date.now() + 5 * 60_000 });
+    const baseUrl = this.config.get<string>('PUBLIC_BASE_URL') ?? '';
+    const cleanUrl = `${baseUrl}/sim/asr-temp/${id}`;
+    this.logger.log(`Audio temp URL: ${cleanUrl}`);
+
+    const attempts: Array<{ method: string; status?: number; result?: unknown; error?: string }> = [];
+
+    // Try 1: OpenAI-compatible /audio/transcriptions (Whisper-style multipart upload)
+    try {
+      const ext = body.mime.includes('webm') ? 'webm' : body.mime.includes('mp4') ? 'm4a' : body.mime.includes('mpeg') ? 'mp3' : body.mime.includes('wav') ? 'wav' : 'webm';
+      const form = new FormData();
+      form.append('file', new Blob([new Uint8Array(audioBytes)], { type: body.mime }), `audio.${ext}`);
+      form.append('model', 'qwen3-asr-flash');
+      const res = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form,
+      });
+      const ct = res.headers.get('content-type') ?? '';
+      const raw: any = ct.includes('json') ? await res.json() : await res.text();
+      attempts.push({ method: 'openai-compat /audio/transcriptions', status: res.status, result: raw });
+      if (res.ok && raw?.text) {
+        return { transcript: raw.text, method: 'openai-compat', attempts };
+      }
+    } catch (e: any) {
+      attempts.push({ method: 'openai-compat /audio/transcriptions', error: e.message });
+    }
+
+    // Try 2: Multimodal with just audio (no text) using public URL
+    try {
+      const res = await fetch('https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'qwen3-asr-flash',
+          input: {
+            messages: [{ role: 'user', content: [{ audio: cleanUrl }] }],
+          },
+        }),
+      });
+      const ct = res.headers.get('content-type') ?? '';
+      const raw: any = ct.includes('json') ? await res.json() : await res.text();
+      attempts.push({ method: 'multimodal (audio-only, public url)', status: res.status, result: raw });
+      if (res.ok) {
+        const transcript =
+          raw?.output?.choices?.[0]?.message?.content?.[0]?.text ??
+          raw?.output?.text ??
+          null;
+        if (transcript) return { transcript, method: 'multimodal-audio-only', attempts };
+      }
+    } catch (e: any) {
+      attempts.push({ method: 'multimodal (audio-only, public url)', error: e.message });
+    }
+
+    // Try 3: Native ASR transcription endpoint with public URL (async job)
+    try {
+      const res = await fetch('https://dashscope-intl.aliyuncs.com/api/v1/services/audio/asr/transcription', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'X-DashScope-Async': 'enable',
+        },
+        body: JSON.stringify({
+          model: 'qwen3-asr-flash',
+          input: { file_urls: [cleanUrl] },
+        }),
+      });
+      const ct = res.headers.get('content-type') ?? '';
+      const raw: any = ct.includes('json') ? await res.json() : await res.text();
+      attempts.push({ method: 'native /audio/asr/transcription (public url, async)', status: res.status, result: raw });
+      // If we got a task_id, poll for result
+      const taskId = raw?.output?.task_id;
+      if (res.ok && taskId) {
+        for (let i = 0; i < 20; i++) {
+          await new Promise((r) => setTimeout(r, 1000));
+          const pollRes = await fetch(`https://dashscope-intl.aliyuncs.com/api/v1/tasks/${taskId}`, {
+            headers: { Authorization: `Bearer ${apiKey}` },
+          });
+          const pollJson: any = await pollRes.json();
+          if (pollJson?.output?.task_status === 'SUCCEEDED') {
+            const url = pollJson?.output?.results?.[0]?.transcription_url;
+            if (url) {
+              const tRes = await fetch(url);
+              const tJson: any = await tRes.json();
+              const text = tJson?.transcripts?.[0]?.text ?? null;
+              if (text) {
+                attempts.push({ method: 'async-poll-result', result: tJson });
+                return { transcript: text, method: 'native-asr-async', attempts };
+              }
+            }
+            attempts.push({ method: 'async-poll-result', result: pollJson });
+            break;
+          }
+          if (pollJson?.output?.task_status === 'FAILED') {
+            attempts.push({ method: 'async-poll-failed', result: pollJson });
+            break;
+          }
+        }
+      }
+    } catch (e: any) {
+      attempts.push({ method: 'native /audio/asr/transcription', error: e.message });
+    }
+
+    return { transcript: null, error: 'All methods failed', attempts, audioUrl: cleanUrl };
+  }
+
+  @Get('asr-test')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  asrTestPage() {
+    return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>myWally - ASR test</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; max-width: 540px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { margin: 0; font-size: 22px; }
+  .sub { color: #666; margin: 4px 0 24px; font-size: 14px; }
+  nav { margin-bottom: 16px; font-size: 13px; }
+  nav a { color: #2563eb; text-decoration: none; margin-right: 14px; }
+  .panel { border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; margin-bottom: 14px; background: #fff; }
+  button { padding: 12px 18px; border: 0; border-radius: 999px; background: #111827; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+  button.recording { background: #dc2626; animation: pulse 1.2s ease-in-out infinite; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
+  .duration { font-family: ui-monospace, Monaco, monospace; font-size: 28px; color: #111827; margin: 16px 0; }
+  .transcript { font-size: 18px; line-height: 1.45; padding: 14px; background: #ecfdf5; border-radius: 8px; border: 1px solid #a7f3d0; min-height: 60px; white-space: pre-wrap; }
+  .transcript:empty::before { content: 'Transcript will appear here...'; color: #6b7280; font-size: 14px; font-style: italic; }
+  .meta { font-size: 12px; color: #6b7280; margin-top: 6px; }
+  pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 10px; border-radius: 6px; font-size: 11px; overflow-x: auto; max-height: 240px; overflow-y: auto; }
+  .audios { margin-top: 12px; }
+  audio { width: 100%; }
+  .phrases { background: #fffbeb; border: 1px solid #fcd34d; padding: 10px 12px; border-radius: 8px; font-size: 13px; color: #78350f; }
+  .phrases ul { margin: 4px 0 0 18px; padding: 0; }
+  .phrases li { margin: 2px 0; }
+</style>
+</head><body>
+<h1>ASR test (Bahasa Melayu)</h1>
+<p class="sub">Records audio in your browser → uploads to backend → calls Alibaba qwen3-asr-flash → shows transcript.</p>
+<nav>
+  <a href="/sim">Testers</a>
+  <a href="/sim/merchant">Checkout</a>
+  <a href="/sim/chat">Chatbot</a>
+  <a href="/sim/asr-test" style="color:#111827; font-weight:600">ASR test</a>
+</nav>
+
+<div class="phrases">
+  <strong>Try saying:</strong>
+  <ul>
+    <li>"Berapa duit saya hari ini?"</li>
+    <li>"Tolong tambah anak saya, Adam, nombor 0123456789"</li>
+    <li>"Macam mana check my balance?" (code-switched)</li>
+    <li>"Hello, what's my spending today?" (English sanity check)</li>
+  </ul>
+</div>
+
+<div class="panel" style="text-align:center; margin-top:14px">
+  <button id="rec-btn">🎙 Tap to record</button>
+  <div class="duration" id="duration">0.0s</div>
+  <div class="meta" id="meta"></div>
+  <div class="audios" id="audios"></div>
+</div>
+
+<div class="panel">
+  <strong>Transcript</strong>
+  <div class="transcript" id="transcript"></div>
+  <details style="margin-top:10px"><summary style="cursor:pointer; color:#666; font-size:12px">raw response</summary>
+  <pre id="raw"></pre>
+  </details>
+</div>
+
+<script>
+let mediaRecorder = null;
+let chunks = [];
+let startedAt = 0;
+let timerId = null;
+let recording = false;
+
+const btn = document.getElementById('rec-btn');
+const dur = document.getElementById('duration');
+const meta = document.getElementById('meta');
+const audios = document.getElementById('audios');
+const transcript = document.getElementById('transcript');
+const raw = document.getElementById('raw');
+
+function fmtDuration(ms) { return (ms / 1000).toFixed(1) + 's'; }
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    alert('Your browser does not support MediaRecorder. Try Chrome or Safari.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      const audioUrl = URL.createObjectURL(blob);
+      audios.innerHTML = '<audio controls src="' + audioUrl + '"></audio>';
+      meta.textContent = mediaRecorder.mimeType + ' · ' + (blob.size / 1024).toFixed(1) + ' KB · ' + fmtDuration(Date.now() - startedAt);
+      await uploadAndTranscribe(blob);
+    };
+    mediaRecorder.start();
+    recording = true;
+    startedAt = Date.now();
+    btn.textContent = '⏹ Stop';
+    btn.classList.add('recording');
+    timerId = setInterval(() => { dur.textContent = fmtDuration(Date.now() - startedAt); }, 100);
+  } catch (e) {
+    alert('Microphone access denied: ' + e.message);
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  clearInterval(timerId);
+  recording = false;
+  btn.textContent = '🎙 Tap to record';
+  btn.classList.remove('recording');
+}
+
+async function uploadAndTranscribe(blob) {
+  transcript.textContent = '';
+  raw.textContent = 'Transcribing...';
+  btn.disabled = true;
+  try {
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const base64 = btoa(binary);
+    const res = await fetch('/sim/asr-test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio: base64, mime: blob.type }),
+    });
+    const json = await res.json();
+    if (json.transcript) {
+      transcript.textContent = json.transcript;
+    } else {
+      transcript.textContent = '(no transcript) ' + (json.error || '');
+    }
+    raw.textContent = JSON.stringify(json.raw ?? json, null, 2);
+  } catch (e) {
+    transcript.textContent = 'Network error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+btn.addEventListener('click', () => {
+  if (recording) stopRecording();
+  else startRecording();
+});
+</script>
+</body></html>`;
+  }
+
   @Get('chat')
   @Header('Content-Type', 'text/html; charset=utf-8')
   chatPage() {
