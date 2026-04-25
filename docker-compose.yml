@@ -53,7 +53,7 @@ services:
       MOONSHOT_BASE_URL: ${MOONSHOT_BASE_URL:-}
       MOONSHOT_MODEL: ${MOONSHOT_MODEL:-}
     ports:
-      - "3000:3000"
+      - "80:3000"
 
 volumes:
   mywally_pg:
