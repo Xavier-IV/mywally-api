@@ -278,7 +278,7 @@ The server is STATELESS for chat. The frontend keeps history and sends the last 
 
 The chat uses an **agentic multi-turn loop** server-side: when the user message triggers a tool, the backend executes the tool, sends the result back to the LLM, and the LLM produces a final narrated reply. This means a single POST may take 2-6 seconds depending on provider/model. Show a typing indicator. Don't time out under 30s.
 
-LLM provider is configurable server-side (\`bedrock | alibaba | anthropic | moonshot\`). The frontend doesn't care which one is active — same response shape across all four. Read \`response.llm.provider\` if you want to display "Powered by ..." somewhere.
+LLM provider is configurable server-side (one of: bedrock, alibaba, anthropic, moonshot). The frontend doesn't care which one is active — same response shape across all four. Read response.llm.provider if you want to display "Powered by ..." somewhere.
 
 # What to build
 
