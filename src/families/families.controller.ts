@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, Post } from '@nestjs/common';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
-import { IsOptional, IsString, Matches } from 'class-validator';
+import { IsOptional, IsString } from 'class-validator';
 import { FamiliesService } from './families.service';
+import { normalizePhoneMY } from '../common/phone';
 
 class CreateFamilyDto {
   @ApiProperty({ example: 'Encik Rahmat', description: 'Parent display name (spoken in voice call)' })
@@ -12,9 +13,8 @@ class CreateFamilyDto {
   @IsString()
   guardianName!: string;
 
-  @ApiProperty({ example: '+60138155761', description: 'E.164 format' })
+  @ApiProperty({ example: '+60138155761', description: 'Accepts E.164 (+60...) or Malaysian local (0138155761). Normalized server-side.' })
   @IsString()
-  @Matches(/^\+[1-9]\d{6,14}$/, { message: 'guardianPhone must be E.164 format, e.g. +60138155761' })
   guardianPhone!: string;
 
   @ApiProperty({ required: false, example: 'Daughter' })
@@ -39,7 +39,15 @@ export class FamiliesController {
     description: 'Bootstraps a parent user, a guardian user (or reuses if phone exists), and links them via Guardianship.',
   })
   async create(@Body() dto: CreateFamilyDto) {
-    const family = await this.families.create(dto);
+    const guardianPhone = normalizePhoneMY(dto.guardianPhone);
+    if (!guardianPhone) {
+      throw new BadRequestException(`Invalid guardianPhone "${dto.guardianPhone}". Use +60... or 01...`);
+    }
+    const parentPhone = dto.parentPhone ? normalizePhoneMY(dto.parentPhone) ?? undefined : undefined;
+    if (dto.parentPhone && !parentPhone) {
+      throw new BadRequestException(`Invalid parentPhone "${dto.parentPhone}". Use +60... or 01...`);
+    }
+    const family = await this.families.create({ ...dto, guardianPhone, parentPhone });
     const gship = family.guardianships[0];
     return {
       familyId: family.id,

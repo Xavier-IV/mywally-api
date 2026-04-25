@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { GuardianshipStatus, UserRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ChatTool, ToolContext, ToolResult } from './tool.interface';
+import { normalizePhoneMY } from '../../common/phone';
 
 @Injectable()
 export class AddFamilyMemberTool implements ChatTool {
@@ -12,7 +13,7 @@ export class AddFamilyMemberTool implements ChatTool {
     type: 'object',
     properties: {
       fullName: { type: 'string', description: 'Display name of the new member.' },
-      phone: { type: 'string', description: 'Phone in E.164 format, e.g. +60138155761' },
+      phone: { type: 'string', description: 'Phone in E.164 (+60138155761) or Malaysian local (0138155761) format. Normalized server-side.' },
       relationshipLabel: {
         type: 'string',
         description: 'Relationship to the parent (e.g. Daughter, Son, Spouse, Sibling).',
@@ -26,11 +27,12 @@ export class AddFamilyMemberTool implements ChatTool {
 
   async execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     const fullName = String(input.fullName ?? '').trim();
-    const phone = String(input.phone ?? '').trim();
+    const rawPhone = String(input.phone ?? '').trim();
     const relationshipLabel = String(input.relationshipLabel ?? '').trim() || 'Guardian';
 
-    if (!/^\+[1-9]\d{6,14}$/.test(phone)) {
-      return { status: 'error', message: `Phone must be E.164 format (got "${phone}")` };
+    const phone = normalizePhoneMY(rawPhone);
+    if (!phone) {
+      return { status: 'error', message: `Invalid phone "${rawPhone}". Use +60... or 01...` };
     }
 
     const family = await this.prisma.family.findFirst({ where: { parentId: ctx.user.id } });
