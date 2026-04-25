@@ -42,6 +42,12 @@ enum DecisionChannel {
   SYSTEM
 }
 
+enum BudgetPeriod {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
 model User {
   id              String    @id @default(uuid())
   role            UserRole
@@ -49,6 +55,7 @@ model User {
   phone           String    @unique
   pinHash         String?
   expoPushToken   String?
+  avatarUrl       String?
   pinLockedUntil  DateTime?
   createdAt       DateTime  @default(now())
 
@@ -61,8 +68,12 @@ model Family {
   id                    String    @id @default(uuid())
   parentId              String
   parent                User      @relation("ParentFamily", fields: [parentId], references: [id])
+  balance               Decimal   @default(0)
   agreementSignedAt     DateTime?
   dailyAutoApproveLimit Decimal   @default(100)
+  budgetAmount          Decimal      @default(100)
+  budgetPeriod          BudgetPeriod @default(DAILY)
+  warningThresholdPercent Int        @default(80)
   createdAt             DateTime  @default(now())
 
   guardianships Guardianship[]
@@ -70,14 +81,18 @@ model Family {
 }
 
 model Guardianship {
-  id         String             @id @default(uuid())
-  familyId   String
-  family     Family             @relation(fields: [familyId], references: [id])
-  guardianId String
-  guardian   User               @relation(fields: [guardianId], references: [id])
-  status     GuardianshipStatus @default(ACTIVE)
-  sunsetAt   DateTime?
-  createdAt  DateTime           @default(now())
+  id                 String             @id @default(uuid())
+  familyId           String
+  family             Family             @relation(fields: [familyId], references: [id])
+  guardianId         String
+  guardian           User               @relation(fields: [guardianId], references: [id])
+  relationshipLabel  String?
+  status             GuardianshipStatus @default(ACTIVE)
+  canViewBalance     Boolean            @default(true)
+  canViewTransactions Boolean           @default(true)
+  canReceiveAlerts   Boolean            @default(true)
+  sunsetAt           DateTime?
+  createdAt          DateTime           @default(now())
 
   @@unique([familyId, guardianId])
 }
