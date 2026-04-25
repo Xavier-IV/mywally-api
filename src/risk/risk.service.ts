@@ -42,11 +42,11 @@ export class RiskService {
     }
 
     const handle = input.recipientHandle.toLowerCase();
-    if (/(crypto|binance|luno|tokenize|bitcoin|wallet)/.test(handle)) {
+    if (/\b(crypto|binance|luno|tokenize|bitcoin)\b/.test(handle)) {
       score += 40;
       reasons.push('crypto_destination');
     }
-    if (/unknown|untrusted/.test(handle)) {
+    if (/\b(unknown|untrusted)\b/.test(handle)) {
       score += 20;
       reasons.push('untrusted_recipient');
     }

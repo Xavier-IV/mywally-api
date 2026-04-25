@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Header, Logger, Post } from '@nestjs/common';
+import { Body, Controller, Get, Header, Logger, NotFoundException, Param, Post } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { AsrService } from '../asr/asr.service';
+import { PrismaService } from '../prisma/prisma.service';
 
 interface AsrTestBody {
   audio: string; // base64 (no data: prefix)
@@ -16,7 +17,44 @@ export class SimulatorController {
   constructor(
     private readonly config: ConfigService,
     private readonly asr: AsrService,
+    private readonly prisma: PrismaService,
   ) {}
+
+  @Post('families/:id/reset-transactions')
+  async resetTransactions(@Param('id') familyId: string) {
+    const f = await this.prisma.family.findUnique({ where: { id: familyId } });
+    if (!f) throw new NotFoundException(`Family ${familyId} not found`);
+    const events = await this.prisma.transactionEvent.deleteMany({
+      where: { transaction: { familyId } },
+    });
+    const decisions = await this.prisma.decisionLog.deleteMany({
+      where: { transaction: { familyId } },
+    });
+    const txs = await this.prisma.transaction.deleteMany({ where: { familyId } });
+    return { familyId, deleted: { transactions: txs.count, events: events.count, decisions: decisions.count } };
+  }
+
+  @Get('families/:id/spending')
+  async familySpending(@Param('id') familyId: string) {
+    const f = await this.prisma.family.findUnique({ where: { id: familyId } });
+    if (!f) throw new NotFoundException(`Family ${familyId} not found`);
+    const start = startOfBudgetPeriodSim(new Date(), f.budgetPeriod);
+    const agg = await this.prisma.transaction.aggregate({
+      where: { familyId, state: 'RELEASED', createdAt: { gte: start } },
+      _sum: { amount: true },
+    });
+    const spent = Number((agg._sum.amount ?? 0).toString());
+    const budget = Number(f.budgetAmount.toString());
+    return {
+      familyId,
+      period: f.budgetPeriod,
+      periodStart: start.toISOString(),
+      spent,
+      budget,
+      remaining: Math.max(0, budget - spent),
+      dailyAutoApproveLimit: Number(f.dailyAutoApproveLimit.toString()),
+    };
+  }
 
   @Post('asr-test')
   async asrTest(@Body() body: AsrTestBody) {
@@ -690,6 +728,7 @@ async function load() {
         <button class="jwt-btn" data-uid="\${f.parent.id}" data-name="\${f.parent.fullName} (parent)">JWT (parent)</button>
         \${f.guardian ? '<button class="jwt-btn" data-uid="' + f.guardian.id + '" data-name="' + f.guardian.fullName + ' (guardian)">JWT (guardian)</button>' : ''}
         \${isBlocked ? '<button class="unblock-btn" data-tx="' + tx.id + '">Unblock</button>' : ''}
+        <a class="btn" href="/sim/budget?familyId=\${encodeURIComponent(f.familyId)}">Budget</a>
         <a class="btn primary" href="/sim/merchant?familyId=\${encodeURIComponent(f.familyId)}">Use this</a>
       </div>
     </div>
@@ -1038,4 +1077,179 @@ bootstrap();
 </script>
 </body></html>`;
   }
+
+  @Get('budget')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  budgetPage() {
+    return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>myWally - family budget (sim)</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; max-width: 540px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { margin: 0; font-size: 22px; }
+  .sub { color: #666; margin: 4px 0 24px; font-size: 14px; }
+  nav { margin-bottom: 16px; font-size: 13px; }
+  nav a { color: #2563eb; text-decoration: none; margin-right: 14px; }
+  nav a.active { color: #111827; font-weight: 600; }
+  .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 18px; margin-bottom: 14px; background: #fff; }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
+  input, select { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+  .hint { font-size: 12px; color: #6b7280; margin-top: 4px; }
+  button { width: 100%; padding: 12px 16px; border: 0; border-radius: 8px; background: #111827; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 12px; }
+  button.secondary { background: #fff; color: #111827; border: 1px solid #d1d5db; }
+  button.danger { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; }
+  .stat { display: flex; justify-content: space-between; padding: 6px 0; font-size: 14px; border-bottom: 1px solid #f3f4f6; }
+  .stat:last-child { border: 0; }
+  .stat strong { color: #111827; }
+</style>
+</head><body>
+<h1>Family budget (sim)</h1>
+<p class="sub">Edit budget + auto-approve. Reset transactions to clear spending history.</p>
+<nav>
+  <a href="/sim">Testers</a>
+  <a href="/sim/merchant">Merchant</a>
+  <a href="/sim/chat">Chatbot</a>
+  <a href="/sim/budget" class="active">Budget</a>
+</nav>
+
+<div id="status" class="card">Loading...</div>
+
+<form id="form" class="card" style="display:none">
+  <h3 style="margin:0 0 4px">Limits</h3>
+  <p style="color:#6b7280; font-size:13px; margin:0 0 12px">Risk engine reads these for every transaction.</p>
+
+  <label>Daily auto-approve limit (RM)</label>
+  <input id="autoApprove" type="number" min="0" step="1"/>
+  <p class="hint">Transactions at or below this amount auto-pass without alerting the guardian. Crypto destinations always halt regardless.</p>
+
+  <label>Budget cap (RM)</label>
+  <input id="budgetAmount" type="number" min="0" step="1"/>
+  <p class="hint">When period spending + this transaction exceeds the cap, risk score gets +30 (likely halts).</p>
+
+  <label>Period</label>
+  <select id="period">
+    <option value="DAILY">Daily</option>
+    <option value="WEEKLY">Weekly</option>
+    <option value="MONTHLY">Monthly</option>
+  </select>
+
+  <label>Warning threshold (% of budget)</label>
+  <input id="warningThresholdPercent" type="number" min="20" max="100" step="5"/>
+  <p class="hint">Informational only. UI can warn the parent at this %.</p>
+
+  <button type="submit">Save</button>
+</form>
+
+<div id="spending" class="card" style="display:none">
+  <h3 style="margin:0 0 8px">Current period spending</h3>
+  <div class="stat"><span>Period start</span><strong id="periodStart">-</strong></div>
+  <div class="stat"><span>Spent in period</span><strong id="spent">-</strong></div>
+  <div class="stat"><span>Remaining</span><strong id="remaining">-</strong></div>
+  <button id="resetBtn" class="danger" style="margin-top:14px">Reset transactions for this family</button>
+  <p class="hint">Deletes all transactions, events and decision logs for this family. Sim only. Use this to start a clean demo.</p>
+</div>
+
+<pre id="out"></pre>
+
+<script>
+const params = new URLSearchParams(location.search);
+let familyId = params.get('familyId');
+
+const $ = (id) => document.getElementById(id);
+
+async function load() {
+  if (!familyId) {
+    $('status').textContent = 'No familyId in URL. Go back to /sim and pick "Budget".';
+    return;
+  }
+  try {
+    const [bRes, fRes] = await Promise.all([
+      fetch('/families/' + familyId + '/budget'),
+      fetch('/families/' + familyId),
+    ]);
+    if (!bRes.ok) throw new Error('budget ' + bRes.status);
+    if (!fRes.ok) throw new Error('family ' + fRes.status);
+    const b = await bRes.json();
+    const f = await fRes.json();
+
+    $('status').innerHTML = '<strong>' + (f.parent?.fullName || 'Family ' + familyId.slice(0,8)) + '</strong> · familyId <code>' + familyId + '</code>';
+    $('autoApprove').value = parseFloat(b.dailyAutoApproveLimit?.value || '0');
+    $('budgetAmount').value = parseFloat(b.amount.value);
+    $('period').value = b.period;
+    $('warningThresholdPercent').value = b.warningThresholdPercent;
+    $('form').style.display = 'block';
+
+    await loadSpending();
+  } catch (e) {
+    $('status').textContent = 'Failed to load: ' + e.message;
+  }
+}
+
+async function loadSpending() {
+  const res = await fetch('/sim/families/' + familyId + '/spending');
+  if (!res.ok) return;
+  const s = await res.json();
+  $('spending').style.display = 'block';
+  $('periodStart').textContent = s.periodStart.slice(0,16).replace('T', ' ');
+  $('spent').textContent = 'RM ' + s.spent.toFixed(2);
+  $('remaining').textContent = 'RM ' + s.remaining.toFixed(2);
+}
+
+$('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = e.target.querySelector('button');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  const body = {
+    amount: parseFloat($('budgetAmount').value),
+    period: $('period').value,
+    warningThresholdPercent: parseInt($('warningThresholdPercent').value, 10),
+    dailyAutoApproveLimit: parseFloat($('autoApprove').value),
+  };
+  const res = await fetch('/families/' + familyId + '/budget', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const json = await res.json();
+  $('out').textContent = JSON.stringify(json, null, 2);
+  btn.disabled = false;
+  btn.textContent = res.ok ? 'Saved ✓' : 'Save';
+  if (res.ok) await loadSpending();
+});
+
+$('resetBtn').addEventListener('click', async () => {
+  if (!confirm('Delete ALL transactions for this family?')) return;
+  const btn = $('resetBtn');
+  btn.disabled = true;
+  btn.textContent = 'Resetting...';
+  const res = await fetch('/sim/families/' + familyId + '/reset-transactions', { method: 'POST' });
+  const json = await res.json();
+  $('out').textContent = JSON.stringify(json, null, 2);
+  btn.disabled = false;
+  btn.textContent = 'Reset transactions for this family';
+  await loadSpending();
+});
+
+load();
+</script>
+</body></html>`;
+  }
+}
+
+function startOfBudgetPeriodSim(now: Date, period: string): Date {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  if (period === 'DAILY') return d;
+  if (period === 'WEEKLY') {
+    const day = d.getDay();
+    d.setDate(d.getDate() - ((day + 6) % 7));
+    return d;
+  }
+  d.setDate(1);
+  return d;
 }

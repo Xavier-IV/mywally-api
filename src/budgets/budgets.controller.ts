@@ -1,7 +1,7 @@
 import { Body, Controller, Get, Param, Put } from '@nestjs/common';
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { BudgetPeriod } from '@prisma/client';
-import { IsEnum, IsInt, IsNumber, Max, Min } from 'class-validator';
+import { IsEnum, IsInt, IsNumber, IsOptional, Max, Min } from 'class-validator';
 import { BudgetsService } from './budgets.service';
 
 export class BudgetDto {
@@ -19,6 +19,16 @@ export class BudgetDto {
   @Min(20)
   @Max(100)
   warningThresholdPercent!: number;
+
+  @ApiProperty({
+    example: 50,
+    required: false,
+    description: 'Amount up to which transactions auto-approve without alerts (RM)',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  dailyAutoApproveLimit?: number;
 }
 
 @ApiTags('budgets')

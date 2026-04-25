@@ -6,6 +6,7 @@ export interface BudgetInput {
   amount: number;
   period: BudgetPeriod;
   warningThresholdPercent: number;
+  dailyAutoApproveLimit?: number;
 }
 
 @Injectable()
@@ -27,6 +28,9 @@ export class BudgetsService {
         budgetAmount: input.amount,
         budgetPeriod: input.period,
         warningThresholdPercent: input.warningThresholdPercent,
+        ...(input.dailyAutoApproveLimit != null
+          ? { dailyAutoApproveLimit: input.dailyAutoApproveLimit }
+          : {}),
       },
     });
     return this.serialize(updated);
@@ -37,12 +41,14 @@ export class BudgetsService {
     budgetAmount: { toString(): string };
     budgetPeriod: BudgetPeriod;
     warningThresholdPercent: number;
+    dailyAutoApproveLimit: { toString(): string };
   }) {
     return {
       familyId: f.id,
       amount: { value: f.budgetAmount.toString(), currency: 'MYR' },
       period: f.budgetPeriod,
       warningThresholdPercent: f.warningThresholdPercent,
+      dailyAutoApproveLimit: { value: f.dailyAutoApproveLimit.toString(), currency: 'MYR' },
     };
   }
 }
