@@ -1,0 +1,63 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mywally
+      POSTGRES_PASSWORD: mywally
+      POSTGRES_DB: mywally
+    ports:
+      - "5433:5432"
+    volumes:
+      - mywally_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mywally"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - mywally_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://mywally:mywally@postgres:5432/mywally?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      JWT_EXPIRES_IN: 7d
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      TWILIO_VALIDATE_SIGNATURE: ${TWILIO_VALIDATE_SIGNATURE:-false}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+      TNG_WEBHOOK_SECRET: ${TNG_WEBHOOK_SECRET:-tng-dev-secret}
+      TNG_VALIDATE_SIGNATURE: ${TNG_VALIDATE_SIGNATURE:-false}
+      PUSH_TIMEOUT_SECONDS: 60
+      CALL_TIMEOUT_SECONDS: 90
+      DEMO_FAKE_VOICE: ${DEMO_FAKE_VOICE:-true}
+    ports:
+      - "3000:3000"
+
+volumes:
+  mywally_pg:
+  mywally_redis:

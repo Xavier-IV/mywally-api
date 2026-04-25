@@ -1,0 +1,157 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  PARENT
+  GUARDIAN
+}
+
+enum GuardianshipStatus {
+  ACTIVE
+  PAUSED
+  REVOKED
+}
+
+enum TransactionState {
+  RECEIVED
+  SCORED
+  HELD
+  NOTIFIED
+  CALLING
+  RELEASED
+  BLOCKED
+  ABORTED
+}
+
+enum DecisionAction {
+  APPROVE
+  REJECT
+  CALL_PARENT
+  TIMEOUT
+}
+
+enum DecisionChannel {
+  PUSH
+  VOICE
+  SYSTEM
+}
+
+model User {
+  id              String    @id @default(uuid())
+  role            UserRole
+  fullName        String
+  phone           String    @unique
+  pinHash         String?
+  expoPushToken   String?
+  pinLockedUntil  DateTime?
+  createdAt       DateTime  @default(now())
+
+  parentFamilies Family[]       @relation("ParentFamily")
+  guardianships  Guardianship[]
+  decisionsMade  DecisionLog[]
+}
+
+model Family {
+  id                    String    @id @default(uuid())
+  parentId              String
+  parent                User      @relation("ParentFamily", fields: [parentId], references: [id])
+  agreementSignedAt     DateTime?
+  dailyAutoApproveLimit Decimal   @default(100)
+  createdAt             DateTime  @default(now())
+
+  guardianships Guardianship[]
+  transactions  Transaction[]
+}
+
+model Guardianship {
+  id         String             @id @default(uuid())
+  familyId   String
+  family     Family             @relation(fields: [familyId], references: [id])
+  guardianId String
+  guardian   User               @relation(fields: [guardianId], references: [id])
+  status     GuardianshipStatus @default(ACTIVE)
+  sunsetAt   DateTime?
+  createdAt  DateTime           @default(now())
+
+  @@unique([familyId, guardianId])
+}
+
+model Transaction {
+  id                   String           @id @default(uuid())
+  familyId             String
+  family               Family           @relation(fields: [familyId], references: [id])
+  externalRef          String           @unique
+  amount               Decimal
+  currency             String           @default("MYR")
+  recipientName        String
+  recipientHandle      String
+  merchantCategory     String?
+  isFirstTimeRecipient Boolean          @default(false)
+  riskScore            Int?
+  riskReasons          String[]         @default([])
+  state                TransactionState @default(RECEIVED)
+  heldAt               DateTime?
+  decidedAt            DateTime?
+  decidedBy            String?
+  decisionReason       String?
+  createdAt            DateTime         @default(now())
+
+  events    TransactionEvent[]
+  decisions DecisionLog[]
+
+  @@index([state])
+  @@index([familyId, createdAt])
+}
+
+model TransactionEvent {
+  id            String      @id @default(uuid())
+  transactionId String
+  transaction   Transaction @relation(fields: [transactionId], references: [id])
+  type          String
+  payload       Json
+  prevHash      String?
+  hash          String
+  createdAt     DateTime    @default(now())
+
+  @@index([transactionId, createdAt])
+}
+
+model DecisionLog {
+  id            String          @id @default(uuid())
+  transactionId String
+  transaction   Transaction     @relation(fields: [transactionId], references: [id])
+  guardianId    String
+  guardian      User            @relation(fields: [guardianId], references: [id])
+  channel       DecisionChannel
+  action        DecisionAction
+  dtmf          String?
+  pinAttempts   Int             @default(0)
+  twilioCallSid String?
+  createdAt     DateTime        @default(now())
+
+  @@index([transactionId])
+}
+
+model RiskRule {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  enabled   Boolean  @default(true)
+  weight    Int      @default(50)
+  params    Json
+  createdAt DateTime @default(now())
+}
+
+model IdempotencyKey {
+  key          String   @id
+  scope        String
+  responseJson Json?
+  createdAt    DateTime @default(now())
+
+  @@index([scope, createdAt])
+}
