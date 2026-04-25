@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { Prisma, TransactionState, DecisionAction, DecisionChannel } from '@prisma/client';
+import { Prisma, TransactionState, DecisionAction, DecisionChannel, BudgetPeriod } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { RiskService, RiskInput } from '../risk/risk.service';
 
@@ -54,12 +54,26 @@ export class TransactionsService {
     });
     await this.appendEvent(tx.id, 'RECEIVED', { input });
 
+    const periodStart = startOfBudgetPeriod(new Date(), family.budgetPeriod);
+    const spentAgg = await this.prisma.transaction.aggregate({
+      where: {
+        familyId: family.id,
+        state: TransactionState.RELEASED,
+        createdAt: { gte: periodStart },
+      },
+      _sum: { amount: true },
+    });
+    const spentInPeriod = Number((spentAgg._sum.amount ?? new Prisma.Decimal(0)).toString());
+
     const riskInput: RiskInput = {
       amount: input.amount,
       currency: input.currency,
       recipientHandle: input.recipientHandle,
       isFirstTimeRecipient: input.isFirstTimeRecipient,
       merchantCategory: input.merchantCategory,
+      dailyAutoApproveLimit: Number(family.dailyAutoApproveLimit.toString()),
+      budgetAmount: Number(family.budgetAmount.toString()),
+      spentInPeriod,
     };
     const riskOut = this.risk.evaluate(riskInput);
 
@@ -208,4 +222,18 @@ export class TransactionsService {
       },
     });
   }
+}
+
+function startOfBudgetPeriod(now: Date, period: BudgetPeriod): Date {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  if (period === 'DAILY') return d;
+  if (period === 'WEEKLY') {
+    const day = d.getDay();
+    const diff = (day + 6) % 7;
+    d.setDate(d.getDate() - diff);
+    return d;
+  }
+  d.setDate(1);
+  return d;
 }

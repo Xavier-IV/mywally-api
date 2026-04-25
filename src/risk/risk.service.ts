@@ -6,6 +6,9 @@ export interface RiskInput {
   recipientHandle: string;
   isFirstTimeRecipient: boolean;
   merchantCategory?: string;
+  dailyAutoApproveLimit?: number;
+  budgetAmount?: number;
+  spentInPeriod?: number;
 }
 
 export interface RiskOutput {
@@ -48,7 +51,28 @@ export class RiskService {
       reasons.push('untrusted_recipient');
     }
 
-    const decision: 'PASS' | 'HOLD' = score >= MED_RISK ? 'HOLD' : 'PASS';
+    if (
+      input.budgetAmount != null &&
+      input.spentInPeriod != null &&
+      input.spentInPeriod + input.amount > input.budgetAmount
+    ) {
+      score += 30;
+      reasons.push('over_budget_period');
+    }
+
+    let decision: 'PASS' | 'HOLD' = score >= MED_RISK ? 'HOLD' : 'PASS';
+
+    const hardBlocked = reasons.includes('crypto_destination');
+    if (
+      decision === 'HOLD' &&
+      !hardBlocked &&
+      input.dailyAutoApproveLimit != null &&
+      input.amount <= input.dailyAutoApproveLimit
+    ) {
+      decision = 'PASS';
+      reasons.push('under_daily_auto_approve_override');
+    }
+
     this.logger.log(`Risk evaluated: score=${score} decision=${decision} reasons=[${reasons.join(',')}]`);
     return { decision, score, reasons };
   }
