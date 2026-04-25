@@ -464,3 +464,63 @@ Picked **self-hosted Postgres in docker-compose on the same ECS box** over **Aps
 **For real production:** ApsaraDB RDS PostgreSQL Singapore (matches DashScope region for low latency from the API). Migration path is a `DATABASE_URL` swap and a `pg_dump | psql` one-liner — no schema or app changes needed.
 
 **Final shape going onto ECS:** one Alibaba ECS instance, Docker installed, `docker compose up -d` brings up `postgres` + `api`. That's the entire backend.
+
+---
+
+## Day 2 (2026-04-26 evening): First deploy — live on https://wally-api.mywally-app.com
+
+End-to-end deployment done in one sitting. From "let's dockerize" to "live on HTTPS with a real domain" was about 90 minutes including the security group, DNS, and one bug fix.
+
+### What got provisioned
+
+| Layer | Choice | Detail |
+|---|---|---|
+| Compute | Alibaba ECS Singapore | `ecs.t6-c1m2.large`, 2 vCPU / 4 GB, Ubuntu 22.04, 40 GB ESSD |
+| Public IP | Direct (no EIP yet) | `47.84.198.251` |
+| Security group | Basic, custom | Inbound 22, 80, 443. RDP closed. SSH still open to all IPs (tighten later) |
+| Auth | SSH key pair | `wally-demo.pem`, locked 400 |
+| Runtime | Docker 29.4.1 + Compose v5.1.3 | Official Docker apt repo |
+| Repo access | GitHub deploy key (read-only) | `mywally-prod-ecs` ed25519 |
+| HTTPS | Cloudflare proxied A record | `wally-api.mywally-app.com` → `47.84.198.251`, **Flexible** SSL mode |
+
+Origin runs plain HTTP on port 80 (`80:3000` in compose). Cloudflare terminates TLS for the public.
+
+### Deploy flow (manual, no CI yet)
+
+```
+local: git push  →  GitHub
+ECS:   ssh, git pull, docker compose up -d --build
+```
+
+### Bugs fixed during deploy
+
+1. **`Cannot find module '/app/dist/main.js'`** on first container start. Cause: `scripts/` directory at repo root makes nest's tsc emit `dist/src/main.js` (with the `src/` prefix) instead of flattened `dist/main.js`. Fix: `CMD ... node dist/src/main.js`. One-line Dockerfile change.
+2. **Couldn't connect to port 3000 from outside.** Security group only allowed 22/80/443. Solved by remapping container port to host port 80 (`80:3000`) instead of opening 3000 in the SG — keeps the surface tight and aligns with Cloudflare's expected origin port.
+3. **Cloudflare 521 "Web server is down".** Cause: SSL/TLS mode defaulted to Full (CF tries HTTPS to origin on port 443, which we don't serve). Fix: switched to **Flexible** so CF↔origin runs HTTP on port 80.
+
+### Tradeoffs we accepted (logged in earlier sections, summarised here)
+
+- No CI: deploy = `ssh && git pull && docker compose up`. Acceptable for one-developer hackathon.
+- No Redis (queue jobs would help with push→voice escalation but not needed for demo).
+- Self-hosted Postgres: same box, no managed backups, no HA.
+- CORS wide open, JWT default fallback exists, Swagger always on, Twilio signature unverified. All flagged in audit table.
+- Cloudflare Flexible SSL: browser↔CF is HTTPS but CF↔origin is HTTP over the public internet. Real production would use Cloudflare Origin Certificate + Full (strict). Fine for demo since the domain is unguessed and traffic is light.
+
+### Live URLs
+
+- API root: `https://wally-api.mywally-app.com`
+- Health: `https://wally-api.mywally-app.com/health` → 200 ✓
+- Swagger: `https://wally-api.mywally-app.com/docs`
+- Sim: `https://wally-api.mywally-app.com/sim`
+
+### What still needs wiring
+
+1. **Twilio voice webhook** — point Voice URL on `+16204558161` to `https://wally-api.mywally-app.com/voice/answer` so guardian calls work in prod.
+2. **End-to-end demo flow on prod** — `/sim/merchant` → halt RM 1500 → guardian phone rings → PIN 1234 → press 1/9/5.
+3. **DashScope ASR** should now work end-to-end too (`PUBLIC_BASE_URL` is the real HTTPS domain → DashScope can fetch `/audio/:id`).
+
+**Key info:** Image builds, container healthy, public HTTPS domain serving the API. Total infra cost so far ~$0 (Alibaba hackathon credits + Cloudflare free tier).
+
+**Key learning:** A Cloudflare proxied subdomain + Flexible SSL is the fastest path from "I have an IP" to "I have HTTPS" on a hackathon timeline. Skipping ACR/SAE/managed databases doesn't matter when one ECS box can hold the whole demo. The 521 "Web server is down" was the only mystery moment, and the fix was 100% on the Cloudflare side, not the origin.
+
+**Next:** Twilio webhook update + end-to-end test on prod.
