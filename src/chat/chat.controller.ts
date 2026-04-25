@@ -5,6 +5,7 @@ import { ArrayMaxSize, IsArray, IsIn, IsOptional, IsString, ValidateNested } fro
 import { Type } from 'class-transformer';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AsrService } from '../asr/asr.service';
 import { ChatService } from './chat.service';
 
 class HistoryItemDto {
@@ -35,12 +36,33 @@ class ChatMessageDto {
   history?: HistoryItemDto[];
 }
 
+class VoiceMessageDto {
+  @ApiProperty({ description: 'base64-encoded audio (no data: prefix)' })
+  @IsString()
+  audio!: string;
+
+  @ApiProperty({ example: 'audio/webm;codecs=opus', description: 'MIME type of the recorded audio' })
+  @IsString()
+  mime!: string;
+
+  @ApiProperty({ required: false, type: [HistoryItemDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(40)
+  @ValidateNested({ each: true })
+  @Type(() => HistoryItemDto)
+  history?: HistoryItemDto[];
+}
+
 @ApiTags('chat')
 @ApiBearerAuth('jwt')
 @UseGuards(JwtAuthGuard)
 @Controller('me/chat')
 export class ChatController {
-  constructor(private readonly chat: ChatService) {}
+  constructor(
+    private readonly chat: ChatService,
+    private readonly asr: AsrService,
+  ) {}
 
   @Get('tools')
   @ApiOperation({
@@ -63,5 +85,30 @@ export class ChatController {
   })
   async send(@CurrentUser() user: User, @Body() dto: ChatMessageDto) {
     return this.chat.handleMessage(user, { text: dto.text, history: dto.history });
+  }
+
+  @Post('messages/voice')
+  @ApiOperation({
+    summary: 'Send a voice note to the chatbot',
+    description:
+      'Audio is uploaded as base64 in JSON. Server transcribes via Alibaba qwen3-asr-flash, ' +
+      'then runs the transcript through the same chat pipeline. Returns the transcript ' +
+      '(so the FE can render it as a user message bubble) plus the standard chat response.',
+  })
+  async sendVoice(@CurrentUser() user: User, @Body() dto: VoiceMessageDto) {
+    const bytes = Buffer.from(dto.audio, 'base64');
+    const { transcript, error, raw } = await this.asr.transcribe(bytes, dto.mime);
+    if (!transcript) {
+      return {
+        transcript: null,
+        reply: { role: 'assistant', text: 'Sorry, I could not hear that clearly. Try again?' },
+        actions: [],
+        ui: [],
+        asrError: error,
+        asrRaw: raw,
+      };
+    }
+    const chat = await this.chat.handleMessage(user, { text: transcript, history: dto.history });
+    return { transcript, ...chat };
   }
 }

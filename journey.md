@@ -233,3 +233,155 @@ Also: cloud provider AI quickstart pages are misleading. Alibaba's "qwen-max-lat
 - **Outbound TNG callback**: when decision is made, POST back to TNG callback URL (mocked).
 - **Named Cloudflare tunnel**: fixed subdomain so demo-day slides don't go stale.
 - **Voice ASR/TTS via AWS**: deferred — needs IAM access keys which the hackathon SSO account may not allow. Bedrock API key only covers Bedrock.
+
+---
+
+## Day 1 (2026-04-26 night): Voice features — what worked, what didn't
+
+A focused investigation: can we add voice to the chatbot using the providers we already have credits for? Outcome: ASR yes, TTS no. Below is the full picture so we don't re-investigate.
+
+### The user demand
+
+myWally targets **elderly Malaysian users**. Voice is the natural interface — many won't type. Need both directions:
+- **Voice in (ASR)**: user speaks BM or Manglish, system understands
+- **Voice out (TTS)**: system speaks back in BM, elderly user listens
+
+### Provider comparison for ASR + TTS
+
+| Provider | ASR | TTS | BM ASR | BM TTS | Same key as our LLM? | Verdict |
+|---|---|---|---|---|---|---|
+| **AWS Transcribe + Polly** | Transcribe | Polly | ✅ Native `ms-MY` (Oct 2024) | ❌ No `ms-MY`, no `id-ID` either (verified in docs) | ❌ Polly/Transcribe need IAM, Bedrock API key insufficient | ASR-only AWS only works if we get IAM creds, TTS unusable for BM |
+| **Alibaba qwen3-* models** | qwen3-asr-flash | qwen3-tts-flash | ✅ Works (transcribes BM as Indonesian — same root) | ❌ Anime/manga voice for BM, unusable | ✅ Same DashScope key as LLM | ASR yes, TTS no |
+| **Google Cloud TTS** | Speech-to-Text | TTS | ✅ Native `ms-MY` | ✅ **Best in industry** for `ms-MY` | ❌ Different vendor | Best for BM TTS, but we don't have credits or wired |
+| **Browser Web Speech / SpeechSynthesis** | SpeechRecognition | SpeechSynthesis | ⚠️ Some browsers support `ms-MY` | ⚠️ Device-dependent | n/a (client-side) | Cheap fallback, varies by user device |
+
+### Why we picked Alibaba ASR + skipped TTS for now
+
+- **ASR via Alibaba**: works, BM-recognizable, single-vendor story holds (LLM + ASR on the same key, billing, audit).
+- **TTS via Alibaba**: tested CosyVoice voices `Cherry`, `Ethan`, `Chelsie`, `Serena`, `Dylan`, `Jada`, `Sunny` with three test phrases (BM, EN, code-switched). All sounded "anime/manga" — wrong language model used as fallback for unsupported BM. **No-go**.
+- **AWS Polly for BM**: docs page in 2026 doesn't list `ms-MY` or even `id-ID` (Indonesian was previously listed; appears removed). So even with IAM creds, no TTS. **Confirmed dead end**.
+- **Google TTS** would solve TTS but adds a third cloud and we don't have credits. **Roadmap, not demo**.
+
+**Decision**: ship ASR via Alibaba for the demo. Voice is one-way (in) only. Output stays text + rich cards. Mention Google TTS as the production TTS roadmap on the architecture slide.
+
+### The Alibaba ASR integration story (for future-me)
+
+`qwen3-asr-flash` is a **dedicated ASR task**, not a multimodal LLM. It does NOT accept the `{audio, text}` content blocks shape that Qwen-Audio expects.
+
+The model is accessed via **async job pattern**:
+
+```
+1. POST /api/v1/services/audio/asr/transcription
+   header: X-DashScope-Async: enable
+   body: { model: 'qwen3-asr-flash', input: { file_urls: ['<public-https-url>'] } }
+   returns: { output: { task_id, task_status: 'PENDING' } }
+
+2. Poll GET /api/v1/tasks/<task_id> every 1s until task_status === 'SUCCEEDED'
+   returns: { output: { results: [{ transcription_url }] } }
+
+3. GET <transcription_url> (a temp signed S3-style URL with the JSON transcript)
+   returns: { transcripts: [{ text: '...' }] }
+```
+
+**Critical gotcha**: `file_urls` MUST be public HTTPS URLs that DashScope can fetch. `data:` URIs don't work. We solve this by:
+
+1. Browser uploads base64 audio to backend.
+2. Backend stores in an in-memory `Map<uuid, {bytes, mime, expiresAt}>` (5-minute TTL).
+3. Backend exposes the audio at `GET /audio/:id` (no auth) served via the Cloudflare tunnel.
+4. Backend sends the tunnel URL to DashScope.
+5. DashScope fetches the audio over HTTPS, transcribes.
+6. Backend purges the in-memory entry after job completes.
+
+Methods we tried before landing on the async-job approach (recorded so we don't repeat):
+
+| Attempt | Endpoint | Result |
+|---|---|---|
+| 1 | OpenAI-compatible `/audio/transcriptions` (Whisper-style multipart upload) | 404 — endpoint doesn't exist on this DashScope account |
+| 2 | Native `multimodal-generation/generation` with `{audio, text}` content | 400 "dedicated task `asr` does not support this input" |
+| 3 | Native `multimodal-generation/generation` with audio-only content + data URL | 400 invalid input |
+| 4 | Native `audio/asr/transcription` with `data:` URI | 400 "url error" — needs HTTPS, not data URI |
+| 5 | Native `audio/asr/transcription` with public tunnel URL + async polling | ✅ **Works** |
+
+**Quality test**: said "cubaan satu dua tiga" in Bahasa Melayu, got back `cobaan satu dua tiga` (Indonesian spelling, same root). Recognizable enough for our chat tools (intent extraction is downstream LLM's job, not the transcript's job to be perfect).
+
+### Code shape
+
+```
+src/asr/
+  asr.module.ts       @Global, exports AsrService
+  asr.service.ts      transcribe(bytes, mime) → { transcript, raw, error }
+                      manages in-memory temp store + 5min TTL
+  asr.controller.ts   GET /audio/:id (public, serves audio bytes)
+
+src/chat/chat.controller.ts
+  POST /me/chat/messages/voice  (auth required)
+    body: { audio: base64, mime: 'audio/webm', history: [...] }
+    returns: { transcript, reply, actions, ui, llm }   ← transcript prepended to chat shape
+
+src/simulator/simulator.controller.ts
+  GET  /sim/chat            ← mic button next to text input
+  POST /sim/asr-test        ← demo-only; calls AsrService.transcribe
+  GET  /sim/asr-test        ← standalone test page
+```
+
+### Frontend pattern (sim/chat)
+
+Mic button uses MediaRecorder. WebKit-compatible MIME selection:
+```
+if ('audio/webm;codecs=opus' supported) → 'audio/webm;codecs=opus'
+elif 'audio/mp4' supported               → 'audio/mp4'
+else                                     → browser default
+```
+
+UX:
+1. Tap mic → `getUserMedia({audio:true})` → record (button red, pulsing)
+2. Tap again → `mediaRecorder.stop()` → `onstop` builds Blob, calls `sendVoiceBlob`
+3. `sendVoiceBlob` immediately appends a `🎙 (voice note...)` placeholder bubble
+4. POSTs base64 audio to `/me/chat/messages/voice`
+5. On response: replaces placeholder text with actual transcript, then appends assistant reply
+
+### Things that broke and the root causes
+
+- **`pollTimer is not defined`**: copy-paste from the merchant page where it polls transaction state. Chat page has no polling — variable was undefined. Fix: removed the line.
+- **Anime-voice TTS**: `qwen3-tts-flash` falls back to a neural voice trained on a different language when BM text is fed in. Likely Mandarin/Cantonese voice profile picked. No way to force language without a BM-specific voice in the catalog. Confirmed by trying every voice in the menu.
+- **`data:` URIs rejected by DashScope ASR**: their fetcher only accepts HTTPS URLs. Easy diagnostic: error message "url error, please check url".
+
+### Updated cost note
+
+- AWS Bedrock: minimal (Sonnet 4.5 calls during chat testing)
+- Alibaba: free tier well within hackathon credits. ASR async jobs ~$0.001 each.
+- Twilio: ~$22 from earlier
+- Google Cloud, Azure: $0 (not used)
+
+**Total: still ~$22 USD.**
+
+### Decisions worth keeping
+
+- **Voice is one-way (in only) for the demo.** TTS deferred to roadmap. Mention Google TTS for production BM voice.
+- **AsrService is `@Global`** so any controller (chat, simulator, future voice-call recording) can use it without explicit imports.
+- **Audio temp store is in-memory with TTL.** No disk I/O, no S3, no persistence. Suitable for hackathon — would swap to S3 with signed URLs in production.
+- **Tunnel is required for ASR.** Local-only dev still works (LLM chat) but voice notes need cloudflared up so DashScope can fetch the audio. Document this clearly in README before handoff.
+
+### Next (revised)
+
+1. **Conference call (press 5)** — Twilio `<Dial><Conference>` between guardian leg + outbound to parent. ~30 min. Demo magic moment.
+2. **Push-first then voice escalation** — Expo Push primary, Twilio call only after 60s no-response. Production credibility.
+3. **Outbound TNG callback** — POST decision back to mocked TNG endpoint when state is RELEASED/BLOCKED.
+4. **Named Cloudflare tunnel** — fixed subdomain (e.g. mywally-api.zafranudin.dev) so the tunnel URL doesn't drift between sessions / demo-day slides don't go stale.
+5. **Browser SpeechSynthesis as 5-min TTS bandaid** — auto-speak assistant replies in chat. Works on most devices, BM voice quality varies but acceptable.
+6. **Avatar placeholders + notifications stub** — small but FE colleague will hit these.
+
+### Compact memo
+
+If/when the conversation is compacted, the key things to know are:
+
+- **4 LLM providers wired** (Bedrock primary, Alibaba secondary, Anthropic+Moonshot configured but inactive). All behind `LlmProvider` interface, swap with `LLM_PROVIDER` env var. Active default: bedrock.
+- **Tools shipped**: add_family_member, list_family_members, set_budget, get_balance, get_spending_summary. Multi-turn loop max 4 hops.
+- **Voice IN works** via Alibaba qwen3-asr-flash, async job pattern, public tunnel URL trick. `POST /me/chat/messages/voice` is the entry point.
+- **Voice OUT skipped** — Alibaba TTS sounds anime, AWS Polly has no BM, Google TTS would work but unwired.
+- **Demo flow remains**: TNG simulator at `/sim/merchant` → halt RM 1500 → guardian phone rings → PIN 1234 → press 1/9/5 → state updates live.
+- **Sim has 4 pages**: `/sim` (testers), `/sim/merchant` (checkout), `/sim/chat` (chatbot with mic), `/sim/asr-test` (standalone ASR test).
+- **Repo**: `Xavier-IV/mywally-api` private. SSH push works.
+- **Hackathon AWS account is federated SSO** — Bedrock works via long-term API key, but Transcribe/Polly/IAM access keys likely blocked by SCP. Don't waste time trying.
+- **Cloudflared tunnel is ephemeral** — URL changes each restart. Need to switch to named tunnel before demo day.
+- **Phone number**: Twilio US `+16204558161`, paid (upgraded), Malaysia outbound enabled. Verified caller IDs not needed since upgrade.

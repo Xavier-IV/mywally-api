@@ -12,6 +12,7 @@ import { FamiliesModule } from './families/families.module';
 import { GuardianshipsModule } from './guardianships/guardianships.module';
 import { BudgetsModule } from './budgets/budgets.module';
 import { ChatModule } from './chat/chat.module';
+import { AsrModule } from './asr/asr.module';
 import { TransactionsModule } from './transactions/transactions.module';
 import { InterventionsModule } from './interventions/interventions.module';
 import { WebhooksModule } from './webhooks/webhooks.module';
@@ -34,6 +35,7 @@ import { SimulatorModule } from './simulator/simulator.module';
     FamiliesModule,
     GuardianshipsModule,
     BudgetsModule,
+    AsrModule,
     ChatModule,
     TwilioModule,
     TransactionsModule,

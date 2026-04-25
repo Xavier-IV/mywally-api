@@ -1,20 +1,11 @@
-import { Body, Controller, Get, Header, Logger, Param, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, Header, Logger, Post } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'crypto';
-import type { Response } from 'express';
+import { AsrService } from '../asr/asr.service';
 
 interface AsrTestBody {
   audio: string; // base64 (no data: prefix)
   mime: string; // e.g. "audio/webm"
-}
-
-// In-memory temp store for audio. Auto-purges after 5 min.
-const TEMP_AUDIO_STORE = new Map<string, { bytes: Buffer; mime: string; expiresAt: number }>();
-
-function pruneExpiredAudio() {
-  const now = Date.now();
-  for (const [k, v] of TEMP_AUDIO_STORE) if (v.expiresAt < now) TEMP_AUDIO_STORE.delete(k);
 }
 
 @ApiExcludeController()
@@ -22,135 +13,15 @@ function pruneExpiredAudio() {
 export class SimulatorController {
   private readonly logger = new Logger(SimulatorController.name);
 
-  constructor(private readonly config: ConfigService) {}
-
-  @Get('asr-temp/:id')
-  async asrTemp(@Param('id') id: string, @Res() res: Response) {
-    pruneExpiredAudio();
-    const item = TEMP_AUDIO_STORE.get(id);
-    if (!item) {
-      res.status(404).send('not found');
-      return;
-    }
-    res.setHeader('Content-Type', item.mime);
-    res.setHeader('Content-Length', item.bytes.length);
-    res.send(item.bytes);
-  }
+  constructor(
+    private readonly config: ConfigService,
+    private readonly asr: AsrService,
+  ) {}
 
   @Post('asr-test')
   async asrTest(@Body() body: AsrTestBody) {
-    const apiKey = this.config.get<string>('ALIBABA_API_KEY');
-    if (!apiKey) return { error: 'ALIBABA_API_KEY not set' };
-
-    this.logger.log(`ASR test: ${body.mime}, ${body.audio.length} base64 chars`);
     const audioBytes = Buffer.from(body.audio, 'base64');
-    pruneExpiredAudio();
-    const id = randomUUID();
-    TEMP_AUDIO_STORE.set(id, { bytes: audioBytes, mime: body.mime, expiresAt: Date.now() + 5 * 60_000 });
-    const baseUrl = this.config.get<string>('PUBLIC_BASE_URL') ?? '';
-    const cleanUrl = `${baseUrl}/sim/asr-temp/${id}`;
-    this.logger.log(`Audio temp URL: ${cleanUrl}`);
-
-    const attempts: Array<{ method: string; status?: number; result?: unknown; error?: string }> = [];
-
-    // Try 1: OpenAI-compatible /audio/transcriptions (Whisper-style multipart upload)
-    try {
-      const ext = body.mime.includes('webm') ? 'webm' : body.mime.includes('mp4') ? 'm4a' : body.mime.includes('mpeg') ? 'mp3' : body.mime.includes('wav') ? 'wav' : 'webm';
-      const form = new FormData();
-      form.append('file', new Blob([new Uint8Array(audioBytes)], { type: body.mime }), `audio.${ext}`);
-      form.append('model', 'qwen3-asr-flash');
-      const res = await fetch('https://dashscope-intl.aliyuncs.com/compatible-mode/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}` },
-        body: form,
-      });
-      const ct = res.headers.get('content-type') ?? '';
-      const raw: any = ct.includes('json') ? await res.json() : await res.text();
-      attempts.push({ method: 'openai-compat /audio/transcriptions', status: res.status, result: raw });
-      if (res.ok && raw?.text) {
-        return { transcript: raw.text, method: 'openai-compat', attempts };
-      }
-    } catch (e: any) {
-      attempts.push({ method: 'openai-compat /audio/transcriptions', error: e.message });
-    }
-
-    // Try 2: Multimodal with just audio (no text) using public URL
-    try {
-      const res = await fetch('https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3-asr-flash',
-          input: {
-            messages: [{ role: 'user', content: [{ audio: cleanUrl }] }],
-          },
-        }),
-      });
-      const ct = res.headers.get('content-type') ?? '';
-      const raw: any = ct.includes('json') ? await res.json() : await res.text();
-      attempts.push({ method: 'multimodal (audio-only, public url)', status: res.status, result: raw });
-      if (res.ok) {
-        const transcript =
-          raw?.output?.choices?.[0]?.message?.content?.[0]?.text ??
-          raw?.output?.text ??
-          null;
-        if (transcript) return { transcript, method: 'multimodal-audio-only', attempts };
-      }
-    } catch (e: any) {
-      attempts.push({ method: 'multimodal (audio-only, public url)', error: e.message });
-    }
-
-    // Try 3: Native ASR transcription endpoint with public URL (async job)
-    try {
-      const res = await fetch('https://dashscope-intl.aliyuncs.com/api/v1/services/audio/asr/transcription', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'X-DashScope-Async': 'enable',
-        },
-        body: JSON.stringify({
-          model: 'qwen3-asr-flash',
-          input: { file_urls: [cleanUrl] },
-        }),
-      });
-      const ct = res.headers.get('content-type') ?? '';
-      const raw: any = ct.includes('json') ? await res.json() : await res.text();
-      attempts.push({ method: 'native /audio/asr/transcription (public url, async)', status: res.status, result: raw });
-      // If we got a task_id, poll for result
-      const taskId = raw?.output?.task_id;
-      if (res.ok && taskId) {
-        for (let i = 0; i < 20; i++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const pollRes = await fetch(`https://dashscope-intl.aliyuncs.com/api/v1/tasks/${taskId}`, {
-            headers: { Authorization: `Bearer ${apiKey}` },
-          });
-          const pollJson: any = await pollRes.json();
-          if (pollJson?.output?.task_status === 'SUCCEEDED') {
-            const url = pollJson?.output?.results?.[0]?.transcription_url;
-            if (url) {
-              const tRes = await fetch(url);
-              const tJson: any = await tRes.json();
-              const text = tJson?.transcripts?.[0]?.text ?? null;
-              if (text) {
-                attempts.push({ method: 'async-poll-result', result: tJson });
-                return { transcript: text, method: 'native-asr-async', attempts };
-              }
-            }
-            attempts.push({ method: 'async-poll-result', result: pollJson });
-            break;
-          }
-          if (pollJson?.output?.task_status === 'FAILED') {
-            attempts.push({ method: 'async-poll-failed', result: pollJson });
-            break;
-          }
-        }
-      }
-    } catch (e: any) {
-      attempts.push({ method: 'native /audio/asr/transcription', error: e.message });
-    }
-
-    return { transcript: null, error: 'All methods failed', attempts, audioUrl: cleanUrl };
+    return this.asr.transcribe(audioBytes, body.mime);
   }
 
   @Get('asr-test')
@@ -378,9 +249,11 @@ btn.addEventListener('click', () => {
 </div>
 
 <form class="composer" id="composer">
-  <input id="text" placeholder="Type a message..." autocomplete="off" />
+  <input id="text" placeholder="Type a message or tap mic..." autocomplete="off" />
+  <button type="button" id="mic" title="Hold mic to speak (Bahasa Melayu / English)">🎙</button>
   <button type="submit" id="send">Send</button>
 </form>
+<div id="rec-status" style="font-size:12px; color:#dc2626; margin-top:6px; min-height:18px"></div>
 
 <details class="panel" style="margin-top:24px">
   <summary style="cursor:pointer; font-weight:600; font-size:13px">📋 Integration prompt for your FE colleague (Next.js)</summary>
@@ -516,6 +389,95 @@ $('composer').addEventListener('submit', (e) => {
   e.preventDefault();
   const t = $('text').value.trim();
   if (t) sendMessage(t);
+});
+
+// ===== Voice (mic) =====
+let mediaRecorder = null;
+let chunks = [];
+let micRecording = false;
+
+async function startMic() {
+  if (!token) { alert('Pick a user first'); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    alert('Browser does not support microphone recording.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/mp4') ? 'audio/mp4' : '';
+    mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      await sendVoiceBlob(blob);
+    };
+    mediaRecorder.start();
+    micRecording = true;
+    $('mic').classList.add('recording');
+    $('mic').textContent = '⏹';
+    $('rec-status').textContent = 'Recording... tap mic again to stop';
+  } catch (e) {
+    alert('Mic access denied: ' + e.message);
+  }
+}
+
+function stopMic() {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  micRecording = false;
+  $('mic').classList.remove('recording');
+  $('mic').textContent = '🎙';
+  $('rec-status').textContent = 'Transcribing... (Alibaba qwen3-asr-flash)';
+}
+
+async function sendVoiceBlob(blob) {
+  $('send').disabled = true;
+  $('mic').disabled = true;
+  appendMessage('user', '🎙 (voice note...)', null);
+  try {
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const base64 = btoa(binary);
+    const res = await fetch('/me/chat/messages/voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+      body: JSON.stringify({ audio: base64, mime: blob.type, history: history.slice() }),
+    });
+    const json = await res.json();
+    $('rec-status').textContent = '';
+    // Replace the placeholder voice-note bubble with the actual transcript
+    const chatEl = $('chat');
+    const lastWrap = chatEl.lastElementChild;
+    if (lastWrap && lastWrap.querySelector('.msg.user')) {
+      lastWrap.querySelector('.msg.user').textContent = json.transcript ? '🎙 ' + json.transcript : '🎙 (could not transcribe)';
+    }
+    if (json.transcript) {
+      history.push({ role: 'user', content: json.transcript });
+    }
+    if (json.reply && json.reply.text) {
+      appendMessage('assistant', json.reply.text, json.actions);
+      history.push({ role: 'assistant', content: json.reply.text });
+      renderUiHints(json.ui);
+    }
+    if (json.asrError) {
+      $('rec-status').textContent = 'ASR error: ' + json.asrError;
+    }
+  } catch (e) {
+    $('rec-status').textContent = 'Network error: ' + e.message;
+  } finally {
+    $('send').disabled = false;
+    $('mic').disabled = false;
+  }
+}
+
+$('mic').addEventListener('click', () => {
+  if (micRecording) stopMic();
+  else startMic();
 });
 
 // Build the integration prompt with the live base URL
@@ -828,6 +790,9 @@ setInterval(load, 5000);
   button:hover { background: #000; }
   button:disabled { opacity: 0.5; cursor: wait; }
   button.secondary { background: #fff; color: #111827; border: 1px solid #d1d5db; }
+  #mic { background: #fff; color: #111827; border: 1px solid #d1d5db; padding: 0 14px; }
+  #mic.recording { background: #dc2626; color: #fff; border-color: #dc2626; animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.05); } }
   pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 12px; border-radius: 8px; font-size: 12px; overflow-x: auto; }
   label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
   input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
