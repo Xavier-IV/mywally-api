@@ -385,3 +385,82 @@ If/when the conversation is compacted, the key things to know are:
 - **Hackathon AWS account is federated SSO** — Bedrock works via long-term API key, but Transcribe/Polly/IAM access keys likely blocked by SCP. Don't waste time trying.
 - **Cloudflared tunnel is ephemeral** — URL changes each restart. Need to switch to named tunnel before demo day.
 - **Phone number**: Twilio US `+16204558161`, paid (upgraded), Malaysia outbound enabled. Verified caller IDs not needed since upgrade.
+
+---
+
+## Day 2 (2026-04-26): Dockerization + production-readiness tradeoff
+
+Switched gears from features to deployment. Goal: get the API running on Alibaba (ECS, since I'm comfortable with the AWS EC2 mental model) before adding more.
+
+### What got done
+
+- Dockerfile rewritten: Node 20 → 22 (matches `.nvmrc`, dodges Prisma+Node25 silent fail), added `libc6-compat` for prisma engines on alpine, non-root `app` user, HEALTHCHECK hitting `/health`, `wget` for the probe.
+- `docker-compose.yml` extended: `env_file: .env` for full passthrough, plus explicit fallbacks for every LLM/voice env (`LLM_PROVIDER`, `ALIBABA_*`, `AWS_BEARER_TOKEN_BEDROCK`, `BEDROCK_MODEL`, `ANTHROPIC_API_KEY`, `MOONSHOT_*`).
+- Build verified clean — `mywally-api:test` image produced.
+- Chat: injected current time + Asia/Kuala_Lumpur into system prompt every turn so "what time is it" stops returning "I don't have access to real-time data."
+- Cloudflared tunnel restarted, new URL: `https://cost-respective-friend-breaks.trycloudflare.com`. DNS quirk: 1.1.1.1 (Cloudflare's own resolver) lagged behind 8.8.8.8 by a few minutes for a fresh quick tunnel. Funny.
+
+### Production-readiness audit (gaps logged, NOT fixed)
+
+Decided to deploy first, harden later. Living with these for now:
+
+| Gap | Risk | Tradeoff accepted because |
+|---|---|---|
+| `enableCors()` no allowlist | Any origin can hit the API | Demo + sim pages need to be reachable; FE colleague hasn't told me their domain yet |
+| `JWT_SECRET` defaults to `dev-secret-change-me` if unset | Forgeable JWTs in prod | Will set a real value in prod `.env`; not adding fail-loud guard yet |
+| Swagger always on at `/docs` | Internals exposed | Judges may want to poke; intentional for hackathon |
+| `TWILIO_VALIDATE_SIGNATURE=false` | Anyone who knows the URL can forge TwiML callbacks | Tunnel hostname is unguessable, and prod will move to a stable domain |
+| `DEMO_FAKE_VOICE` default still `true` in compose | Skipping real Twilio if env not set | Easy to flip in prod `.env` |
+| PIN hardcoded `1234` | Trivial bypass | Demo design |
+
+**Why this tradeoff:** Deploy day eats prep time. Better to surface real deploy issues (secrets, networking, DNS, image pull from ACR) on a staging instance than polish CORS allowlists locally and discover ECS issues on demo day.
+
+### Plan from here
+
+1. **Database hosting** — ApsaraDB PostgreSQL + ApsaraDB Redis in Singapore (closest to DashScope). Considering self-host on the same ECS box for hackathon cost.
+2. **Docker hosting** — push to ACR Singapore, run `docker compose up` on ECS instance. Open 443 inbound, lock 22 to my IP.
+3. **Domain routing** — Cloudflare proxied subdomain → ECS public IP, SSL via Cloudflare. Then update `PUBLIC_BASE_URL` and Twilio voice webhook URL one final time and never touch it again.
+
+**Key info:** Image `mywally-api:test` builds clean. Compose uses `env_file: .env` so prod just needs a real `.env` on the box.
+
+**Key learning:** Hackathon production-readiness is a different game from real production-readiness. Listing the gaps explicitly with reasoning (instead of pretending the code is hardened) is more honest and lets you patch the right one fast if a judge asks.
+
+**Next:** Provision ApsaraDB Postgres + Redis on Alibaba Singapore.
+
+### Redis dropped (deliberate sacrifice)
+
+Audit revealed Redis was wired (`BullModule.forRoot` in `app.module.ts`) but **no queue is defined or consumed anywhere in the codebase**. Pure vestigial infrastructure from the original "schedule push timeout, escalate to voice" plan that ended up implemented synchronously in `InterventionsService`.
+
+**Decision:** removed Redis from `docker-compose.yml`, BullMQ from `app.module.ts` and `package.json`, `REDIS_HOST/REDIS_PORT` from `.env.example`. One less service to provision on Alibaba, one less failure mode on demo day.
+
+**What we sacrifice:** the architecturally correct way to do push→voice escalation, retries, scheduled timeouts, idempotent webhook processing, and outbound TNG callbacks would all use a job queue. Doing them synchronously means:
+- A slow Twilio call blocks the request thread
+- A crash mid-orchestration loses state (no retry)
+- No visibility into in-flight jobs (no Bull board / Arena)
+- Webhook processing is "best effort" — if the handler throws, TNG would need to retry us
+
+**For demo this is fine** because the flow is short, single-tenant, and we control both ends of every webhook. **For real production** Redis/BullMQ comes back in on day one — push→voice escalation alone needs a delayed job, and TNG retry semantics in production demand idempotent processing with dedupe keys backed by Redis.
+
+**Memo to future self:** when re-introducing Redis, the first queue to add is `intervention-escalation` (push-then-call with 60s delay), and the dedupe key store for webhook idempotency. Everything else is nice-to-have.
+
+### Postgres: self-host on ECS (deliberate sacrifice)
+
+Picked **self-hosted Postgres in docker-compose on the same ECS box** over **ApsaraDB RDS PostgreSQL** for the demo.
+
+**What we sacrifice:**
+- No managed backups (snapshot via `pg_dump` cron at best, or skip entirely for demo)
+- No HA / automatic failover — if the ECS box dies, the demo dies with it
+- No point-in-time recovery
+- Disk on ECS local volume, not multi-AZ
+- We're the DBA: tuning, vacuum, version upgrades all manual
+- Same blast radius as the API: a runaway query OOMs the box, the API goes too
+
+**Why it's fine for the hackathon:**
+- One box, one bill, one IP to whitelist for Twilio + DashScope
+- Compose already has a healthy `postgres:16-alpine` service with named volume
+- Demo is read/write light: a handful of users, ~10 transactions live
+- If we lose the box on demo day we restart the box, not the world
+
+**For real production:** ApsaraDB RDS PostgreSQL Singapore (matches DashScope region for low latency from the API). Migration path is a `DATABASE_URL` swap and a `pg_dump | psql` one-liner — no schema or app changes needed.
+
+**Final shape going onto ECS:** one Alibaba ECS instance, Docker installed, `docker compose up -d` brings up `postgres` + `api`. That's the entire backend.

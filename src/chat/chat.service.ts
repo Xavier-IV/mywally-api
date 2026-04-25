@@ -33,7 +33,24 @@ export interface ChatResponse {
 
 const MAX_TOOL_HOPS = 4;
 
-const SYSTEM_PROMPT = `You are myWally's family-safety assistant. The user is signed in already.
+function buildSystemPrompt(): string {
+  const now = new Date();
+  const kl = now.toLocaleString('en-MY', {
+    timeZone: 'Asia/Kuala_Lumpur',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  return `Current time: ${kl} (Asia/Kuala_Lumpur, MYT). ISO: ${now.toISOString()}.
+
+${SYSTEM_PROMPT_BODY}`;
+}
+
+const SYSTEM_PROMPT_BODY = `You are myWally's family-safety assistant. The user is signed in already.
 Your job is to help them manage their family setup, budget, and member permissions in a fintech app.
 
 Rules:
@@ -96,7 +113,7 @@ export class ChatService {
 
     for (let hop = 0; hop < MAX_TOOL_HOPS; hop++) {
       const out = await this.llm.generate({
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt: buildSystemPrompt(),
         turns,
         tools: toolSpecs,
       });

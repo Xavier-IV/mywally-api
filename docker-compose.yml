@@ -16,33 +16,18 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6380:6379"
-    volumes:
-      - mywally_redis:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   api:
     build: .
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+    env_file:
+      - .env
     environment:
       NODE_ENV: production
       PORT: 3000
       DATABASE_URL: postgresql://mywally:mywally@postgres:5432/mywally?schema=public
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
       JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
       JWT_EXPIRES_IN: 7d
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
@@ -55,9 +40,20 @@ services:
       PUSH_TIMEOUT_SECONDS: 60
       CALL_TIMEOUT_SECONDS: 90
       DEMO_FAKE_VOICE: ${DEMO_FAKE_VOICE:-true}
+      LLM_PROVIDER: ${LLM_PROVIDER:-alibaba}
+      LLM_MODEL: ${LLM_MODEL:-}
+      ALIBABA_API_KEY: ${ALIBABA_API_KEY:-}
+      ALIBABA_BASE_URL: ${ALIBABA_BASE_URL:-}
+      ALIBABA_MODEL: ${ALIBABA_MODEL:-}
+      AWS_REGION: ${AWS_REGION:-ap-southeast-1}
+      AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}
+      BEDROCK_MODEL: ${BEDROCK_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      MOONSHOT_BASE_URL: ${MOONSHOT_BASE_URL:-}
+      MOONSHOT_MODEL: ${MOONSHOT_MODEL:-}
     ports:
       - "3000:3000"
 
 volumes:
   mywally_pg:
-  mywally_redis:
