@@ -2,6 +2,7 @@ import { BadRequestException, Body, Controller, Get, Param, Post } from '@nestjs
 import { ApiOperation, ApiProperty, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString } from 'class-validator';
 import { FamiliesService } from './families.service';
+import { AuthService } from '../auth/auth.service';
 import { normalizePhoneMY } from '../common/phone';
 
 class CreateFamilyDto {
@@ -31,7 +32,10 @@ class CreateFamilyDto {
 @ApiTags('families')
 @Controller('families')
 export class FamiliesController {
-  constructor(private readonly families: FamiliesService) {}
+  constructor(
+    private readonly families: FamiliesService,
+    private readonly auth: AuthService,
+  ) {}
 
   @Post()
   @ApiOperation({
@@ -49,6 +53,7 @@ export class FamiliesController {
     }
     const family = await this.families.create({ ...dto, guardianPhone, parentPhone });
     const gship = family.guardianships[0];
+    const { token } = await this.auth.issueTokenForUserId(family.parent.id);
     return {
       familyId: family.id,
       parent: {
@@ -62,6 +67,7 @@ export class FamiliesController {
         phone: gship.guardian.phone,
         relationshipLabel: gship.relationshipLabel,
       },
+      auth: { token, tokenType: 'Bearer', userId: family.parent.id },
     };
   }
 
